@@ -18,3 +18,11 @@ __pycache__/
 # Editor
 .vscode/
 *.swp
+.#*
+*.user
+qtcreator-*
+
+# Misc
+*.pyc
+*.pcd
+*~
