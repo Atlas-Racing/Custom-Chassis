@@ -1,0 +1,5 @@
+zed_node:
+  ros__parameters:
+    general:
+      grab_resolution: 'HD1080'
+      pub_resolution: 'NATIVE'   # publish at the same resolution as grab (no downscale)

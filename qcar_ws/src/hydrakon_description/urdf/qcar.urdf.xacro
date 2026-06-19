@@ -1,0 +1,196 @@
+<?xml version="1.0"?>
+<robot name="hydrakon" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- Brings in the zed_camera macro, which defines zed_camera_link and all of
+       its internal sub-frames (camera_center, left/right, optical, ZED2
+       mag/baro/temp). The zed_node's positional tracking init blocks forever
+       waiting for TF lookups between these exact frames (its base_frame is
+       hardcoded to "<camera_name>_camera_link"); without this include they
+       never exist since publish_urdf is false for the ZED node itself. -->
+  <xacro:include filename="$(find zed_wrapper)/urdf/zed_macro.urdf.xacro" />
+
+  <!-- ═══ Materials ══════════════════════════════════════════════════════════ -->
+  <material name="white">   <color rgba="1 1 1 1"/></material>
+  <material name="grey">    <color rgba="0.4 0.4 0.4 1"/></material>
+  <material name="dark_grey"><color rgba="0.15 0.15 0.15 1"/></material>
+
+  <!-- ═══ Chassis (base_link) ════════════════════════════════════════════════ -->
+  <!--
+    Single combined mesh (body + wheels + hubs baked together) - the
+    separate body/hub/wheel STLs no longer exist. Raw STL units are 0.1mm
+    (raw / 100 = cm), so scale = 0.0001 to land in metres for URDF. This
+    gives a ~40.9cm long / ~17.4cm wide chassis, consistent with the
+    25.7cm wheelbase already encoded in the hub/wheel joint origins below.
+  -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hydrakon_description/meshes/custom_chassis_body.stl"
+              scale="0.0001 0.0001 0.0001"/>
+      </geometry>
+      <material name="white"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://hydrakon_description/meshes/custom_chassis_body.stl"
+              scale="0.0001 0.0001 0.0001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <mass value="2.0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.04" iyz="0" izz="0.04"/>
+    </inertial>
+  </link>
+
+  <!-- Ground projection frame -->
+  <link name="base_footprint"/>
+  <joint name="base_to_footprint" type="fixed">
+    <parent link="base_link"/>
+    <child link="base_footprint"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ═══ Front-Left Steering Hub ════════════════════════════════════════════ -->
+  <!-- No standalone mesh - already baked into base_link's combined chassis mesh. -->
+  <link name="hubfl">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+  </link>
+  <joint name="base_hubfl_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="hubfl"/>
+    <origin xyz="0.1296 0.0559 0.03338" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.5236" upper="0.5236" effort="300" velocity="2"/>
+    <dynamics damping="0.143" friction="0"/>
+  </joint>
+
+  <!-- ═══ Front-Right Steering Hub ═══════════════════════════════════════════ -->
+  <!-- No standalone mesh - already baked into base_link's combined chassis mesh. -->
+  <link name="hubfr">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+  </link>
+  <joint name="base_hubfr_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="hubfr"/>
+    <origin xyz="0.1296 -0.0559 0.03338" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.5236" upper="0.5236" effort="300" velocity="2"/>
+    <dynamics damping="0.143" friction="0"/>
+  </joint>
+
+  <!-- ═══ Front-Left Wheel ════════════════════════════════════════════════════ -->
+  <!-- No standalone mesh - already baked into base_link's combined chassis mesh. -->
+  <link name="wheelfl">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+  </link>
+  <joint name="hubfl_wheelfl_joint" type="continuous">
+    <parent link="hubfl"/>
+    <child link="wheelfl"/>
+    <origin xyz="0 0 0" rpy="0 0 3.14"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ═══ Front-Right Wheel ═══════════════════════════════════════════════════ -->
+  <!-- No standalone mesh - already baked into base_link's combined chassis mesh. -->
+  <link name="wheelfr">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+  </link>
+  <joint name="hubfr_wheelfr_joint" type="continuous">
+    <parent link="hubfr"/>
+    <child link="wheelfr"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ═══ Rear-Left Wheel ═════════════════════════════════════════════════════ -->
+  <!-- No standalone mesh - already baked into base_link's combined chassis mesh. -->
+  <link name="wheelrl">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+  </link>
+  <joint name="base_wheelrl_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheelrl"/>
+    <origin xyz="-0.12765 0.0561 0.03338" rpy="0 0 3.14"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ═══ Rear-Right Wheel ════════════════════════════════════════════════════ -->
+  <!-- No standalone mesh - already baked into base_link's combined chassis mesh. -->
+  <link name="wheelrr">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+  </link>
+  <joint name="base_wheelrr_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheelrr"/>
+    <origin xyz="-0.12765 -0.0561 0.03338" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ═══ Upper Plate (Jetson + ZED mount) ═══════════════════════════════════ -->
+  <!--
+    No standalone mesh - already baked into base_link's combined chassis
+    mesh. This link still exists purely as the reference frame the camera
+    mount is measured from (its origin represents the plate's centre).
+  -->
+  <link name="upper_plate_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.3"/>
+      <inertia ixx="5e-4" ixy="0" ixz="0" iyy="5e-4" iyz="0" izz="5e-4"/>
+    </inertial>
+  </link>
+  <joint name="base_to_upper_plate" type="fixed">
+    <parent link="base_link"/>
+    <child link="upper_plate_link"/>
+    <!-- Plate sits centred over the origin, ground-to-plate height unchanged -->
+    <origin xyz="0.0 0.0 0.06" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ═══ ZED2 Camera ══════════════════════════════════════════════════════════
+    zed_camera_link (and all its sub-frames: camera_center, left/right,
+    optical, ZED2 mag/baro/temp) come from the zed_camera macro included
+    above. The macro's zed_camera_link has no parent of its own — we attach
+    it to our upper_plate_link here. The ZED2's internal IMU frame
+    (zed_imu_link) is broadcast dynamically by the zed_node itself at
+    runtime, not declared in URDF.
+
+    Measured directly off the plate: 14.12cm forward and 7.287cm above the
+    plate's centre, tilted 10.1 deg nose-down to look at the track ahead.
+  ════════════════════════════════════════════════════════════════════════════ -->
+  <xacro:zed_camera name="zed" model="zed2">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:zed_camera>
+  <joint name="upper_plate_to_zed" type="fixed">
+    <parent link="upper_plate_link"/>
+    <child link="zed_camera_link"/>
+    <origin xyz="0.1412 0.0 0.07287" rpy="0 0.17627825445142728 0"/>
+  </joint>
+
+</robot>
