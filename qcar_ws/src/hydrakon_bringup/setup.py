@@ -29,6 +29,8 @@ setup(
             'slam = hydrakon_bringup.slam:main',
             'cone_fusion = hydrakon_bringup.cone_fusion_node:main',
             'ad_pure_pursuit = hydrakon_bringup.ad_pure_pursuit:main',
+            'ad_acceleration = hydrakon_bringup.ad_acceleration:main',
+            'adsdv_pure_pursuit = hydrakon_bringup.adsdv_pure_pursuit:main',
             'pure_pursuit = hydrakon_bringup.pure_pursuit:main',
             'sf_pure_pursuit = hydrakon_bringup.sf_pure_pursuit:main',
             'ap_pure_pursuit = hydrakon_bringup.ap_pure_pursuit:main',

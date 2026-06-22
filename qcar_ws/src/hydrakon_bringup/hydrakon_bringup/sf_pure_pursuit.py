@@ -6,36 +6,14 @@ from rclpy.node import Node
 import numpy as np
 import math
 
+from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Path, Odometry
-from geometry_msgs.msg import Twist, PointStamped, PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from visualization_msgs.msg import MarkerArray
 
 from tf2_ros import Buffer, TransformListener
-from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 import tf2_geometry_msgs
 
-class PIDController:
-    #just to handle the throttle control
-    def __init__(self, kp, ki, kd, min_val, max_val):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.min_val, self.max_val = min_val, max_val
-        self.prev_error, self.integral, self.last_time = 0.0, 0.0, None
-
-    def update(self, error, current_time):
-        if self.last_time is None:
-            self.last_time = current_time
-            return 0.0
-        dt = current_time - self.last_time
-        if dt <= 0.0: return 0.0
-
-        p = self.kp * error
-        self.integral += error * dt
-        i = self.ki * self.integral
-        d = self.kd * (error - self.prev_error) / dt
-        self.prev_error, self.last_time = error, current_time
-        return max(self.min_val, min(self.max_val, p + i + d))
-
-# get yaw from quaternion
 def get_yaw_from_quaternion(q):
     siny_cosp = 2.0 * (q.w*q.z + q.x*q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y*q.y + q.z*q.z)
@@ -53,9 +31,6 @@ class PurePursuit(Node):
         self.current_speed = 0.0
         self.local_cones = []
 
-        self.is_finished = False
-
-        #can tune speed and lookahead stuff over here. also the virtual offset
         self.virtual_offset = 2.5
         self.cone_tube_radius = 4.0 #blinder so that car dont go boom boom, i.e. dont see cones its not concerned with
 
@@ -70,9 +45,7 @@ class PurePursuit(Node):
 
         self.min_lookahead = 3.0
         self.max_lookahead = 6.5
-        self.lookahead_speed_factor = 0.5 #increases loohahead with speed
-
-        self.speed_pid = PIDController(kp=1.0, ki=0.01, kd=0.0, min_val=-1.0, max_val=1.0) #tune kp for throttle control
+        self.lookahead_speed_factor = 0.5 #increases lookahead with speed
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -81,7 +54,7 @@ class PurePursuit(Node):
         self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.create_subscription(MarkerArray, '/camera/cone_markers', self.marker_callback, 10)
 
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_pub = self.create_publisher(AckermannDriveStamped, '/ackermann_cmd', 10)
         self.target_pub = self.create_publisher(PointStamped, '/pure_pursuit/target', 10)
         self.local_path_pub = self.create_publisher(Path, '/pure_pursuit/local_track', 10)
 
@@ -213,54 +186,26 @@ class PurePursuit(Node):
         return np.array(traced_path)
 
     def control_loop(self):
-        current_time = self.get_clock().now().nanoseconds / 1e9
-
-        if self.is_finished:
-            cmd = Twist()
-            cmd.linear.x = -1.0 # Brakes applied
-            cmd.angular.z = 0.0
-            self.cmd_pub.publish(cmd)
-            return
-
-        if self.path is not None and len(self.path) > 0:
-            dist_to_end = math.hypot(self.path[-1][0] - self.car_pos[0], self.path[-1][1] - self.car_pos[1])
-            if len(self.path) < 45 and dist_to_end < 4.0:
-                self.is_finished = True
-                self.get_logger().info("Finish Line Reached! Braking")
-                return
-
-
         control_lookahead = max(self.min_lookahead, min(self.max_lookahead, self.current_speed * self.lookahead_speed_factor))
 
         local_path = self.generate_smooth_local_track()
+
+        if local_path is None:
+            self.get_logger().warn('No cone pairs visible — stopping.', throttle_duration_sec=2.0)
+            self._publish_stop()
+            return
+
+        self.publish_local_path_rviz(local_path)
+
         target_x, target_y = None, None
+        for i in range(1, len(local_path)):
+            dist = math.hypot(local_path[i][0], local_path[i][1])
+            if dist >= control_lookahead:
+                target_x, target_y = local_path[i][0], local_path[i][1]
+                break
 
-        if local_path is not None:
-            self.publish_local_path_rviz(local_path)
-
-            for i in range(1, len(local_path)):
-                dist = math.hypot(local_path[i][0], local_path[i][1])
-                if dist >= control_lookahead:
-                    target_x, target_y = local_path[i][0], local_path[i][1]
-                    break
-
-            if target_x is None:
-                target_x, target_y = local_path[-1][0], local_path[-1][1]
-
-        elif self.path is not None and len(self.path) > 0:
-            distances = np.linalg.norm(self.path - self.car_pos, axis=1)
-            closest_idx = np.argmin(distances)
-            target_global = self.path[-1]
-
-            for i in range(closest_idx, len(self.path)):
-                if np.linalg.norm(self.path[i] - self.car_pos) >= control_lookahead:
-                    target_global = self.path[i]
-                    break
-
-            dx, dy = target_global[0] - self.car_pos[0], target_global[1] - self.car_pos[1]
-            target_x = math.cos(-self.car_yaw) * dx - math.sin(-self.car_yaw) * dy
-            target_y = math.sin(-self.car_yaw) * dx + math.cos(-self.car_yaw) * dy
-        else: return
+        if target_x is None:
+            target_x, target_y = local_path[-1][0], local_path[-1][1]
 
         ld = max(0.1, math.hypot(target_x, target_y))
         raw_steering = math.atan((2.0 * self.wheelbase * (target_y / ld)) / ld)
@@ -271,14 +216,23 @@ class PurePursuit(Node):
 
         steer_ratio = (abs(final_steering) / self.max_steer) ** 2
         target_speed = self.max_speed - steer_ratio * (self.max_speed - self.min_speed)
-        throttle = self.speed_pid.update(target_speed - self.current_speed, current_time)
 
-        cmd = Twist()
-        cmd.linear.x = float(throttle)
-        cmd.angular.z = float(self.steering_polarity * final_steering)
-        self.cmd_pub.publish(cmd)
+        drive = AckermannDriveStamped()
+        drive.header.stamp = self.get_clock().now().to_msg()
+        drive.header.frame_id = 'base_link'
+        drive.drive.speed = float(target_speed)
+        drive.drive.steering_angle = float(self.steering_polarity * final_steering)
+        self.cmd_pub.publish(drive)
 
         self.publish_debug_target(target_x, target_y)
+
+    def _publish_stop(self):
+        drive = AckermannDriveStamped()
+        drive.header.stamp = self.get_clock().now().to_msg()
+        drive.header.frame_id = 'base_link'
+        drive.drive.speed = 0.0
+        drive.drive.steering_angle = 0.0
+        self.cmd_pub.publish(drive)
 
     def publish_debug_target(self, local_x, local_y):
         gx = self.car_pos[0] + math.cos(self.car_yaw) * local_x - math.sin(self.car_yaw) * local_y

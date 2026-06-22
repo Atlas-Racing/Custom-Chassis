@@ -41,7 +41,8 @@ def generate_launch_description():
             PathJoinSubstitution([camera_pkg, 'launch', 'camera.launch.py'])
         ),
         launch_arguments={
-            'camera_model': 'zed2',
+            'camera_model': 'zedx',
+            'enable_ipc': 'false',
         }.items(),
     )
 
