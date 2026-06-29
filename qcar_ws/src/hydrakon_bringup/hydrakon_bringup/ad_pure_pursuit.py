@@ -49,12 +49,18 @@ class PurePursuitNode(Node):
         self.declare_parameter('min_lookahead',      0.3)
         # < 0.5 shifts midpoint toward yellow (right), away from blue (left).
         # Compensates for car body width — 0.45 is a good starting point.
-        self.declare_parameter('centerline_bias',    0.2)
+        self.declare_parameter('centerline_bias',    0.45)
 
         # Speed
-        self.declare_parameter('target_speed',       0.1)
-        self.declare_parameter('min_speed',          0.05)
-        self.declare_parameter('single_side_speed', 0.12)  # fixed speed in single-side boundary-following mode
+        self.declare_parameter('target_speed',       0.13)
+        self.declare_parameter('min_speed',          0.10)
+        self.declare_parameter('single_side_speed',  0.11)  # fixed speed in single-side boundary-following mode (yellow turns)
+        self.declare_parameter('blue_turn_speed',    0.10)  # slower for blue (right) turns — compensates for hardware understeer
+        self.declare_parameter('cone_loss_timeout',  0.4)   # seconds to keep last cmd before stopping when cones disappear
+        self.declare_parameter('long_kp',            0.8)    # longitudinal P gain
+        self.declare_parameter('long_kd',            0.2)  # longitudinal D gain — keep small to avoid derivative kick
+        self.declare_parameter('long_ki',            0.5)   # longitudinal I gain — overcomes pull-out torque
+        self.declare_parameter('long_i_max',         0.1)   # anti-windup clamp on integral accumulator (m/s·s)
 
         # Blue cone repulsion — pushes steer right when a blue cone is too close
         self.declare_parameter('blue_repulsion_radius', 0.8)   # m
@@ -63,9 +69,6 @@ class PurePursuitNode(Node):
         # Right-turn understeer compensation — multiplies raw_steer when turning right
         self.declare_parameter('right_steer_multiplier', 1.4)
 
-        # Stop-and-steer for right turns (chassis hardware limitation)
-        # When required right steer exceeds this threshold, stop and hold max right steering.
-        self.declare_parameter('right_steer_threshold', 0.55)  # rad — only fires on sharp right turns
 
         # PID damping on lateral error (y-component of target in car frame)
         # kd damps oscillation; ki corrects persistent drift; i_max prevents windup
@@ -91,10 +94,15 @@ class PurePursuitNode(Node):
         self.target_speed           = g('target_speed')
         self.min_speed              = g('min_speed')
         self.single_side_speed      = g('single_side_speed')
+        self.blue_turn_speed        = g('blue_turn_speed')
+        self.cone_loss_timeout      = g('cone_loss_timeout')
+        self.long_kp                = g('long_kp')
+        self.long_kd                = g('long_kd')
+        self.long_ki                = g('long_ki')
+        self.long_i_max             = g('long_i_max')
         self.blue_repulsion_radius   = g('blue_repulsion_radius')
         self.blue_repulsion_gain     = g('blue_repulsion_gain')
         self.right_steer_multiplier  = g('right_steer_multiplier')
-        self.right_steer_threshold   = g('right_steer_threshold')
         self.steer_kd    = g('steer_kd')
         self.steer_ki    = g('steer_ki')
         self.steer_i_max = g('steer_i_max')
@@ -113,13 +121,20 @@ class PurePursuitNode(Node):
         self._speed       = 0.0
         self._steer_ema   = 0.0
         self._single_side = False
+        self._blue_side   = False
         self._blue_cones  = []
         self._yellow_cones = []
+        self._last_cone_time = self.get_clock().now()
 
-        # PID state
+        # Lateral PID state
         self._prev_lateral_error = 0.0
         self._lateral_integral   = 0.0
         self._prev_control_time  = None
+
+        # Longitudinal PID state
+        self._prev_speed_error = 0.0
+        self._speed_integral   = 0.0
+        self._cmd_speed        = 0.0
 
     # ── Interfaces ─────────────────────────────────────────────────────────────
 
@@ -170,10 +185,14 @@ class PurePursuitNode(Node):
 
         target = self._get_target(blue, yellow)
         if target is None:
-            self.get_logger().warn('No valid cones — stopping.', throttle_duration_sec=2.0)
-            self.stop()
+            elapsed = (self.get_clock().now() - self._last_cone_time).nanoseconds / 1e9
+            if elapsed > self.cone_loss_timeout:
+                self.get_logger().warn('No valid cones — stopping.', throttle_duration_sec=2.0)
+                self.stop()
+            # else: keep last published command — brief dropout, don't brake
             return
 
+        self._last_cone_time = self.get_clock().now()
         self._publish_target_debug(target)
         self._execute_control(target)
 
@@ -243,23 +262,49 @@ class PurePursuitNode(Node):
         yellow_ahead = sorted([c for c in yellow if c[0] > 0.0], key=lambda p: p[0])
 
         if blue_ahead and yellow_ahead:
-            self._single_side = False
-            nearest_blue   = min(blue_ahead,   key=lambda p: np.linalg.norm(p))
-            nearest_yellow = min(yellow_ahead, key=lambda p: np.linalg.norm(p))
-            return self.centerline_bias * nearest_blue + (1.0 - self.centerline_bias) * nearest_yellow
+            # Use only the nearest cone on each side — ignore everything further.
+            best_blue, best_yellow = blue_ahead[0], yellow_ahead[0]
 
-        # Single side: follow the boundary curvature with a small inward offset.
+            dist_blue   = float(np.linalg.norm(best_blue))
+            dist_yellow = float(np.linalg.norm(best_yellow))
+
+            # Reject the gate if the x-mismatch is too large OR if one cone is
+            # radially much farther than the other (near-blue + far-yellow false pair).
+            x_mismatch_ok = abs(best_blue[0] - best_yellow[0]) <= 1.5
+            dist_ratio_ok = dist_yellow < dist_blue * 2.0 and dist_blue < dist_yellow * 2.0
+
+            if x_mismatch_ok and dist_ratio_ok:
+                self._single_side = False
+                target = self.centerline_bias * best_blue + (1.0 - self.centerline_bias) * best_yellow
+                nudge_y = 0.0
+                if dist_blue < dist_yellow / 1.5:
+                    nudge_y = -0.3
+                elif dist_yellow < dist_blue / 1.5:
+                    nudge_y = 0.3
+                return target + np.array([0.0, nudge_y])
+
+            # Gate rejected: fall through to single-side using the closer boundary
+            if dist_blue < dist_yellow:
+                yellow_ahead = []
+            else:
+                blue_ahead = []
+
+        # Single side: follow the boundary curvature, offset to track centre.
         # Left turn  → only yellow (right boundary) visible.
         # Right turn → only blue  (left  boundary) visible.
         self._single_side = True
         if yellow_ahead:
+            self._blue_side = False
             if len(yellow_ahead) == 1:
-                # Only one yellow cone — steer left to scan for more of the boundary.
                 cone = yellow_ahead[0]
-                return np.array([cone[0], cone[1] + self.track_half_width])
-            return self._boundary_target(yellow_ahead, side='right')
+                return np.array([cone[0], cone[1] + self.track_half_width - self.yellow_offset])
+            return self._boundary_target(yellow_ahead[:3], side='right')
         if blue_ahead:
-            return self._boundary_target(blue_ahead, side='left')
+            self._blue_side = True
+            if len(blue_ahead) == 1:
+                cone = blue_ahead[0]
+                return np.array([cone[0], cone[1] - self.track_half_width])
+            return self._boundary_target(blue_ahead[:3], side='left')
 
         return None
 
@@ -278,7 +323,7 @@ class PurePursuitNode(Node):
             coeffs = np.polyfit(xs, ys, deg)
         except np.linalg.LinAlgError:
             p  = cones[0]
-            dy = -self.track_half_width if side == 'left' else self.track_half_width
+            dy = -self.track_half_width if side == 'left' else (self.track_half_width - self.yellow_offset)
             return p + np.array([0.0, dy])
 
         # For blue (right turn), look 1.5 m ahead to better capture cone curvature;
@@ -287,11 +332,11 @@ class PurePursuitNode(Node):
         eval_x  = float(np.clip(lookahead_x, xs[0], xs[-1]))
         curve_y = float(np.polyval(coeffs, eval_x))
 
-        # Lateral offset toward track centre — always keeps target at positive x
+        # Lateral offset toward track centre
         if side == 'left':
-            target_y = curve_y - self.track_half_width   # right of blue boundary
+            target_y = curve_y - self.track_half_width                      # right of blue boundary
         else:
-            target_y = curve_y + self.yellow_offset      # left of yellow boundary — stay close
+            target_y = curve_y + self.track_half_width - self.yellow_offset  # left of yellow boundary, pulled back from blue
 
         return np.array([eval_x, target_y])
 
@@ -301,10 +346,15 @@ class PurePursuitNode(Node):
         x, y = float(target[0]), float(target[1])
         dist = math.hypot(x, y)
 
-        # PID derivative + integral on lateral error (target y in car frame)
+        # Compute dt — used by both lateral and longitudinal PID
         now = self.get_clock().now()
+        dt  = 0.033  # ~30 Hz fallback
         if self._prev_control_time is not None:
             dt = max((now - self._prev_control_time).nanoseconds / 1e9, 1e-4)
+        self._prev_control_time = now
+
+        # Lateral PID: derivative + integral on target y in car frame
+        if dt < 1.0:  # skip on first tick (no prev_control_time)
             d_term = self.steer_kd * (y - self._prev_lateral_error) / dt
             self._lateral_integral = float(np.clip(
                 self._lateral_integral + y * dt,
@@ -315,7 +365,6 @@ class PurePursuitNode(Node):
             d_term = 0.0
             i_term = 0.0
         self._prev_lateral_error = y
-        self._prev_control_time  = now
 
         # Pure pursuit steering: δ = atan(2L sinα / ld)
         ld    = max(self.min_lookahead, dist)
@@ -343,27 +392,39 @@ class PurePursuitNode(Node):
         drive.header.stamp    = self.get_clock().now().to_msg()
         drive.header.frame_id = 'base_link'
 
-        # Stop-and-steer: chassis cannot produce enough right steering while moving.
-        # Only applies when both cone colours are visible — single-side boundary
-        # following already steers toward the curve and must not be interrupted.
-        if not self._single_side and self._steer_ema < -self.right_steer_threshold:
-            drive.drive.speed          = 0.0
-            drive.drive.steering_angle = self.max_steer   # positive = right on hardware
+        # Target speed — governed by alpha (angle to target), not EMA steering.
+        # Alpha is a leading indicator: it reacts to upcoming turn sharpness immediately,
+        # before steering has built up, so the car slows before it enters the turn.
+        alpha_ratio = min(abs(alpha) / (math.pi / 2), 1.0)  # 0 = straight, 1 = 90 deg
+        if self._single_side and self._blue_side:
+            spd_min, spd_max = self.blue_turn_speed, self.single_side_speed
         elif self._single_side:
-            # In boundary-following mode use a flat speed — steering-ratio reduction
-            # would fight the floor and keep speed below the motor dead zone.
-            drive.drive.speed          = float(self.single_side_speed)
-            drive.drive.steering_angle = -float(self._steer_ema)
+            spd_min, spd_max = self.min_speed, self.single_side_speed
         else:
-            steering_ratio = abs(self._steer_ema) / self.max_steer
-            speed = self.min_speed + (self.target_speed - self.min_speed) * (1.0 - steering_ratio)
-            drive.drive.speed          = float(max(0.0, speed))
-            drive.drive.steering_angle = -float(self._steer_ema)
+            spd_min, spd_max = self.min_speed, self.target_speed
+        # Quadratic drop: speed falls hard even at moderate turn angles
+        tgt = spd_min + (spd_max - spd_min) * (1.0 - alpha_ratio) ** 2
+
+        # Longitudinal PID on speed error
+        spd_error = tgt - self._speed
+        spd_d     = (spd_error - self._prev_speed_error) / dt
+        self._speed_integral = float(np.clip(
+            self._speed_integral + spd_error * dt,
+            -self.long_i_max, self.long_i_max,
+        ))
+        self._cmd_speed = float(np.clip(
+            self.long_kp * spd_error + self.long_kd * spd_d + self.long_ki * self._speed_integral,
+            self.min_speed, tgt,
+        ))
+        self._prev_speed_error = spd_error
+
+        drive.drive.speed          = self._cmd_speed
+        drive.drive.steering_angle = -float(self._steer_ema)
 
         self.get_logger().info(
-            f'[CMD] spd={drive.drive.speed:.3f} steer={drive.drive.steering_angle:.3f} | '
-            f'target=({x:.2f},{y:.2f}) d={d_term:.3f} i={i_term:.3f} '
-            f'single_side={self._single_side} '
+            f'[CMD] spd={drive.drive.speed:.3f} tgt={tgt:.3f} actual={self._speed:.3f} | '
+            f'steer={drive.drive.steering_angle:.3f} target=({x:.2f},{y:.2f}) '
+            f'd={d_term:.3f} i={i_term:.3f} single_side={self._single_side} blue_side={self._blue_side} '
             f'n_blue={len(self._blue_cones)} n_yellow={len(self._yellow_cones)}',
             throttle_duration_sec=0.5,
         )
@@ -386,12 +447,15 @@ class PurePursuitNode(Node):
         self.target_pub.publish(t)
 
     def stop(self):
+        self._speed_integral   = 0.0
+        self._prev_speed_error = 0.0
         drive = AckermannDriveStamped()
         drive.header.stamp    = self.get_clock().now().to_msg()
         drive.header.frame_id = 'base_link'
         drive.drive.speed     = 0.0
         drive.drive.steering_angle = 0.0
         self.drive_pub.publish(drive)
+
 
 
 def main(args=None):
